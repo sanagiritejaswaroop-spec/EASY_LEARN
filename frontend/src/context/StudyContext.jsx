@@ -18,6 +18,7 @@ export const StudyProvider = ({ children }) => {
   const [longQData, setLongQData] = useState(null);
   const [flashcardData, setFlashcardData] = useState(null);
   const [mockExamData, setMockExamData] = useState(null);
+  const [examMissionData, setExamMissionData] = useState(null);
 
   const resetSession = () => {
     setDocData(null);
@@ -30,6 +31,7 @@ export const StudyProvider = ({ children }) => {
     setLongQData(null);
     setFlashcardData(null);
     setMockExamData(null);
+    setExamMissionData(null);
   };
 
   return (
@@ -59,6 +61,8 @@ export const StudyProvider = ({ children }) => {
         setFlashcardData,
         mockExamData,
         setMockExamData,
+        examMissionData,
+        setExamMissionData,
         resetSession,
       }}
     >

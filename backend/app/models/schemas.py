@@ -11,6 +11,8 @@ class UploadResponse(BaseModel):
     estimated_chapters: int
     status: str
     extracted_text_preview: str
+    concepts: Optional[List[str]] = []
+
 
 class ConceptCard(BaseModel):
     number: str
@@ -119,11 +121,54 @@ class MockExamResponse(BaseModel):
     questions: List[MockExamQuestion]
 
 class ChatRequest(BaseModel):
-    file_id: str
+    file_id: Optional[str] = ""
     message: str
     history: Optional[List[Dict[str, str]]] = []
 
 class ChatResponse(BaseModel):
     reply: str
     sources: Optional[List[str]] = []
-    suggested_followups: List[str]
+    suggested_followups: List[str] = []
+    success: Optional[bool] = True
+    error_type: Optional[str] = None
+
+class CheckpointQuestion(BaseModel):
+    id: str
+    question: str
+    options: List[MCQOption]
+    correct_option_id: str
+    explanation: str
+    topic: str
+
+class ExamMissionDay(BaseModel):
+    day_number: int
+    title: str
+    goal: str
+    topics: List[str]
+    estimated_time: str
+    difficulty: str
+    activities: List[str]
+    checkpoint_title: str
+    checkpoint_questions: List[CheckpointQuestion]
+    is_completed: bool = False
+    score: Optional[int] = None
+
+class ExamMissionResponse(BaseModel):
+    mission_id: str
+    subject: str
+    days_remaining: int
+    exam_date: Optional[str] = None
+    total_topics: int
+    total_estimated_time: str
+    is_exam_eve: bool = False
+    days: List[ExamMissionDay]
+
+class ExamMissionRequest(BaseModel):
+    days_remaining: Optional[int] = 5
+    exam_date: Optional[str] = None
+
+class AdaptMissionRequest(BaseModel):
+    weak_topic: str
+    failed_day_number: int
+    current_days: List[ExamMissionDay]
+

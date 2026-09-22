@@ -7,7 +7,8 @@ from app.services.mock_exam_service import mock_exam_service
 from app.models.schemas import (
     SummaryResponse, TopicsResponse, MCQResponse,
     ShortQuestionsResponse, MediumQuestionsResponse,
-    LongQuestionsResponse, FlashcardResponse, MockExamResponse
+    LongQuestionsResponse, FlashcardResponse, MockExamResponse,
+    ExamMissionResponse, ExamMissionRequest, AdaptMissionRequest
 )
 
 router = APIRouter(prefix="/api", tags=["study"])
@@ -84,3 +85,33 @@ async def get_mock_exam(file_id: str, time_limit_minutes: int = Query(30, ge=10,
         return data
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+@router.post("/exam-mission/{file_id}", response_model=ExamMissionResponse)
+async def create_exam_mission(file_id: str, req: ExamMissionRequest):
+    try:
+        from app.services.exam_mission_service import exam_mission_service
+        data = await exam_mission_service.generate_exam_mission(
+            file_id,
+            days_remaining=req.days_remaining or 5,
+            exam_date=req.exam_date
+        )
+        return data
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate exam mission: {str(e)}")
+
+@router.post("/exam-mission/{file_id}/adapt")
+async def adapt_exam_mission(file_id: str, req: AdaptMissionRequest):
+    try:
+        from app.services.exam_mission_service import exam_mission_service
+        current_dict_days = [d.dict() for d in req.current_days]
+        updated_days = await exam_mission_service.adapt_exam_mission(
+            file_id, current_dict_days, req.weak_topic, req.failed_day_number
+        )
+        return {"status": "adapted", "days": updated_days}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to adapt exam mission: {str(e)}")
+

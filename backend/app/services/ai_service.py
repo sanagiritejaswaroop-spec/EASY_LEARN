@@ -2,77 +2,202 @@ import httpx
 import json
 import re
 import math
+import asyncio
 from collections import Counter
 from typing import Dict, Any, List, Optional
 from app.config import settings
+
+import os
 
 class AIService:
     """Service for generating study material using external LLMs or internal smart NLP fallback engine."""
 
     def __init__(self):
-        self.api_key = settings.AI_API_KEY
         self.model = settings.AI_MODEL
         self.base_url = settings.AI_BASE_URL.rstrip('/')
+        self.last_error_type = None
+
+    @property
+    def api_key(self) -> str:
+        key = os.getenv("AI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or settings.AI_API_KEY or ""
+        return key.strip()
+
+    def get_api_key(self) -> str:
+        return self.api_key
+
+    def get_model_name(self) -> str:
+        configured = os.getenv("AI_MODEL") or settings.AI_MODEL or "gemini-3.6-flash"
+        obsolete_models = [
+            "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", 
+            "gemini-2.0-flash-lite", "gemini-2.5-flash"
+        ]
+        if configured in obsolete_models:
+            return "gemini-3.6-flash"
+        return configured
+
+    async def _post_with_retry(
+        self,
+        url: str,
+        headers: dict,
+        payload: dict,
+        action_label: str = "Gemini API",
+        timeout_seconds: float = 12.0,
+        max_retries: int = 1
+    ) -> tuple[Optional[dict], Optional[int]]:
+        """
+        Helper to POST to Gemini API with controlled 1-retry policy for transient errors (HTTP 503, 429, Network timeouts).
+        Backoff delay: 0.8s. Per-request HTTP timeout: 12s.
+        """
+        backoff_delays = [0.8]
+        last_status = None
+        self.last_error_type = None
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                delay = backoff_delays[min(attempt - 1, len(backoff_delays) - 1)]
+                print(f"[AIService] Transient failure on {action_label}. Retrying (attempt {attempt}/{max_retries}) after {delay}s backoff...")
+                await asyncio.sleep(delay)
+
+            print(f"[AIService] Calling {action_label} (attempt {attempt + 1}/{max_retries + 1})...")
+            try:
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                    res = await client.post(url, headers=headers, json=payload)
+                    last_status = res.status_code
+                    print(f"[AIService] {action_label} response status: {res.status_code}")
+
+                    if res.status_code == 200:
+                        self.last_error_type = None
+                        return res.json(), 200
+
+                    # Handle transient errors: 503 (High Demand/Busy) or 429 (Rate Limit)
+                    if res.status_code in [503, 429]:
+                        self.last_error_type = "AI_SERVICE_UNAVAILABLE" if res.status_code == 503 else "RATE_LIMIT"
+                        print(f"[AIService] {action_label} transient HTTP {res.status_code}: {res.text[:250]}")
+                        # Will loop to retry if attempt < max_retries
+                        continue
+                    elif res.status_code in [401, 403]:
+                        self.last_error_type = "INVALID_API_KEY"
+                        print(f"[AIService] {action_label} permanent auth error HTTP {res.status_code}: {res.text[:250]}")
+                        return None, res.status_code
+                    else:
+                        self.last_error_type = "API_ERROR"
+                        print(f"[AIService] {action_label} HTTP error ({res.status_code}): {res.text[:250]}")
+                        return None, res.status_code
+
+            except (httpx.TimeoutException, httpx.NetworkError) as net_err:
+                self.last_error_type = "NETWORK_ERROR"
+                print(f"[AIService] {action_label} network exception (attempt {attempt + 1}): {repr(net_err)}")
+                # Will loop to retry if attempt < max_retries
+                continue
+            except Exception as e:
+                self.last_error_type = "UNKNOWN_ERROR"
+                print(f"[AIService] {action_label} non-retryable exception: {repr(e)}")
+                return None, last_status
+
+        return None, last_status
+
 
     async def generate_json(self, prompt: str, system_prompt: str = "You are EASY-LEARN, an expert AI Study Assistant.") -> Optional[Dict[str, Any]]:
-        """Call Google Gemini REST API with provided prompt."""
-        if not self.api_key or self.api_key == "YOUR_GEMINI_API_KEY" or len(self.api_key) < 15:
+        """Call Google Gemini REST API with provided prompt for JSON response."""
+        key = self.api_key
+        if not key or key == "YOUR_GEMINI_API_KEY" or len(key) < 10:
+            print(f"[AIService] generate_json ABORTED: API Key is missing or placeholder (key len: {len(key)})")
+            self.last_error_type = "UNCONFIGURED_KEY"
             return None
 
-        # Models to attempt (specified model first, fallback to standard 1.5-flash / 2.0-flash)
-        models_to_try = [self.model]
-        if "1.5-flash" not in self.model:
-            models_to_try.append("gemini-1.5-flash")
-        if "2.0-flash" not in self.model:
-            models_to_try.append("gemini-2.0-flash")
-
+        model_name = self.get_model_name()
         base = self.base_url.rstrip('/')
+        model_path = model_name if model_name.startswith("models/") else f"models/{model_name}"
+        url = f"{base}/v1beta/{model_path}:generateContent?key={key}"
 
-        for model_name in models_to_try:
-            model_path = model_name if model_name.startswith("models/") else f"models/{model_name}"
-            url = f"{base}/v1beta/{model_path}:generateContent?key={self.api_key}"
+        headers = {
+            "Content-Type": "application/json"
+        }
 
-            headers = {
-                "Content-Type": "application/json"
-            }
-
-            payload = {
-                "systemInstruction": {
+        payload = {
+            "systemInstruction": {
+                "parts": [
+                    {"text": system_prompt + " Respond strictly in valid JSON format."}
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
                     "parts": [
-                        {"text": system_prompt + " Respond strictly in valid JSON format with unique, highly informative, exam-oriented answers. Do not wrap output in unnecessary Markdown unless inside JSON string fields."}
+                        {"text": prompt}
                     ]
-                },
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [
-                            {"text": prompt}
-                        ]
-                    }
-                ],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "temperature": 0.3
                 }
+            ],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.3
             }
+        }
 
-            try:
-                async with httpx.AsyncClient(timeout=45.0) as client:
-                    res = await client.post(url, headers=headers, json=payload)
-                    if res.status_code == 200:
-                        data = res.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            if parts:
-                                raw_text = parts[0].get("text", "")
-                                clean_text = re.sub(r'^```(json)?\s*', '', raw_text.strip(), flags=re.IGNORECASE)
-                                clean_text = re.sub(r'\s*```$', '', clean_text).strip()
-                                return json.loads(clean_text)
-                    else:
-                        print(f"[AIService] Gemini API ({model_name}) error ({res.status_code}): {res.text[:200]}. Trying fallback model...")
-            except Exception as e:
-                print(f"[AIService] Gemini API ({model_name}) exception: {e}")
+        data, status = await self._post_with_retry(url, headers, payload, action_label=f"Gemini API ({model_name})")
+        if data:
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    raw_text = parts[0].get("text", "")
+                    clean_text = re.sub(r'^```(json)?\s*', '', raw_text.strip(), flags=re.IGNORECASE)
+                    clean_text = re.sub(r'\s*```$', '', clean_text).strip()
+                    
+                    try:
+                        return json.loads(clean_text, strict=False)
+                    except Exception as p_err:
+                        print(f"[AIService] JSON parse failed: {p_err}. Trying regex object match...")
+
+                    json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+                    if json_match:
+                        try:
+                            return json.loads(json_match.group(0), strict=False)
+                        except Exception as r_err:
+                            print(f"[AIService] Regex JSON parse failed: {r_err}")
+            else:
+                print(f"[AIService] No candidates returned in Gemini JSON response: {data}")
+
+        return None
+
+    async def generate_text(self, prompt: str, system_prompt: str = "You are EASY-LEARN, an expert AI Assistant.") -> Optional[str]:
+        """Call Google Gemini REST API to generate freeform text response."""
+        key = self.api_key
+        if not key or key == "YOUR_GEMINI_API_KEY" or len(key) < 10:
+            print(f"[AIService] generate_text ABORTED: API Key is missing or placeholder (key len: {len(key)})")
+            self.last_error_type = "UNCONFIGURED_KEY"
+            return None
+
+        model_name = self.get_model_name()
+        base = self.base_url.rstrip('/')
+        model_path = model_name if model_name.startswith("models/") else f"models/{model_name}"
+        url = f"{base}/v1beta/{model_path}:generateContent?key={key}"
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.4
+            }
+        }
+
+        data, status = await self._post_with_retry(url, headers, payload, action_label=f"Gemini Text API ({model_name})")
+        if data:
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "").strip()
+            else:
+                print(f"[AIService] No candidates returned in Gemini text response: {data}")
 
         return None
 
@@ -82,13 +207,17 @@ class AIService:
         s = sentence.strip()
         if len(s) < 25 or len(s) > 350:
             return False
-        
+
+        from app.services.pdf_service import is_metadata_line
+        if is_metadata_line(s):
+            return False
+
         noise_patterns = [
-            r'text\s*book\s*:', r'course\s*instructor', r'b\.?\s*tech', r'cse-?', r'aiml',
-            r'edition,', r'publisher', r'isbn', r'copyright', r'all\s*rights\s*reserved',
+            r'text\s*book', r'instructor', r'b\.?\s*tech', r'cse', r'aiml', r'ece', r'eee',
+            r'edition', r'publisher', r'isbn', r'copyright', r'rights\s*reserved',
             r'figure\s*\d+', r'table\s*\d+', r'shows\s*a\s*typical\s*view', r'box\s*of\s*figure',
-            r'page\s*\d+', r'unit\s*-\s*[ivx0-9]+', r'syllabus', r'dept\s*of', r'department\s*of',
-            r'author\s*:', r'written\s*by', r'lecture\s*notes'
+            r'page\s*\d+', r'unit\s*-\s*[ivx0-9]+', r'syllabus', r'dept\s*of', r'department',
+            r'author', r'written\s*by', r'lecture\s*notes', r'james\s+allen', r'pearson', r'education'
         ]
         
         for pat in noise_patterns:
@@ -293,15 +422,29 @@ class AIService:
         top_phrases = [p for p, c in phrase_counts.most_common(max_topics * 2)]
         top_single = [w.capitalize() for w, c in word_counts.most_common(max_topics * 2)]
 
+        from app.services.pdf_service import is_metadata_line, is_valid_educational_topic
+
+        def norm_stem(term: str) -> str:
+            clean_term = term.lower().strip()
+            clean_term = re.sub(r's$', '', clean_term)
+            clean_term = re.sub(r'es$', '', clean_term)
+            return clean_term
+
         combined_candidates = []
         for p in top_phrases:
-            if p not in combined_candidates:
-                combined_candidates.append(p)
+            if is_valid_educational_topic(p, full_text=text):
+                p_stem = norm_stem(p)
+                if not any(norm_stem(existing) == p_stem for existing in combined_candidates):
+                    combined_candidates.append(p)
+
         for s in top_single:
-            if s not in combined_candidates and not any(s.lower() in p.lower() for p in combined_candidates):
-                combined_candidates.append(s)
+            if is_valid_educational_topic(s, full_text=text):
+                s_stem = norm_stem(s)
+                if not any(norm_stem(existing) == s_stem or s_stem in norm_stem(existing) for existing in combined_candidates):
+                    combined_candidates.append(s)
 
         selected_topics = combined_candidates[:max_topics]
+
         if len(selected_topics) < 3:
             selected_topics.extend(["Fundamental Concepts", "System Architecture", "Performance Analysis"])
 

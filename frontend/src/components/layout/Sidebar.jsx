@@ -1,7 +1,7 @@
 import React from 'react';
 import { 
   FileText, Star, HelpCircle, CheckSquare, ListOrdered, 
-  BookOpen, Layers, Award, MessageSquareText, Sparkles 
+  BookOpen, Layers, Award, MessageSquareText, Sparkles, Target
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { useStudy } from '../../context/StudyContext';
@@ -10,6 +10,7 @@ export const Sidebar = () => {
   const { activeView, setActiveView } = useStudy();
 
   const navItems = [
+    { id: 'mission', label: 'Exam Pulse', icon: Target, badge: 'Adaptive' },
     { id: 'summary', label: 'Summary', icon: FileText, badge: 'Overview' },
     { id: 'topics', label: 'Important Topics', icon: Star, badge: 'Top 95%' },
     { id: 'mcq', label: 'MCQ Test', icon: CheckSquare, badge: 'Interactive' },

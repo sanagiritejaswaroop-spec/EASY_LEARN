@@ -55,7 +55,8 @@ async def upload_pdf(file: UploadFile = File(...)):
             total_words=doc_data["total_words"],
             estimated_chapters=doc_data["estimated_chapters"],
             status="Complete",
-            extracted_text_preview=preview
+            extracted_text_preview=preview,
+            concepts=doc_data.get("concepts", [])
         )
 
     except HTTPException:

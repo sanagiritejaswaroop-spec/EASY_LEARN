@@ -69,8 +69,29 @@ export const sendChatMessage = async (fileId, message, history = []) => {
   const res = await fetch(`${API_BASE}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ file_id: fileId, message, history }),
+    body: JSON.stringify({ file_id: fileId || "", message, history }),
   });
   if (!res.ok) throw new Error('Failed to process chat message');
   return await res.json();
 };
+
+export const generateExamMission = async (fileId, daysRemaining = 5, examDate = null) => {
+  const res = await fetch(`${API_BASE}/exam-mission/${fileId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ days_remaining: daysRemaining, exam_date: examDate }),
+  });
+  if (!res.ok) throw new Error('Failed to generate exam mission plan');
+  return await res.json();
+};
+
+export const adaptExamMission = async (fileId, currentDays, weakTopic, failedDayNumber) => {
+  const res = await fetch(`${API_BASE}/exam-mission/${fileId}/adapt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current_days: currentDays, weak_topic: weakTopic, failed_day_number: failedDayNumber }),
+  });
+  if (!res.ok) throw new Error('Failed to adapt exam mission plan');
+  return await res.json();
+};
+

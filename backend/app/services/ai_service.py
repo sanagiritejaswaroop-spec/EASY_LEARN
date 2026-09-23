@@ -3,203 +3,252 @@ import json
 import re
 import math
 import asyncio
+import os
+import time
 from collections import Counter
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from app.config import settings
 
-import os
-
 class AIService:
-    """Service for generating study material using external LLMs or internal smart NLP fallback engine."""
+    """Service for generating study material using OpenRouter LLM API or internal smart NLP fallback engine."""
 
     def __init__(self):
-        self.model = settings.AI_MODEL
-        self.base_url = settings.AI_BASE_URL.rstrip('/')
-        self.last_error_type = None
+        self.last_error_type: Optional[str] = None
+        self.last_status_code: Optional[int] = None
+        self.last_provider_calls: int = 0
+        self.last_user_message: str = ""
 
     @property
     def api_key(self) -> str:
-        key = os.getenv("AI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or settings.AI_API_KEY or ""
+        key = os.getenv("OPENROUTER_API_KEY") or settings.OPENROUTER_API_KEY or os.getenv("AI_API_KEY") or ""
         return key.strip()
 
     def get_api_key(self) -> str:
         return self.api_key
 
     def get_model_name(self) -> str:
-        configured = os.getenv("AI_MODEL") or settings.AI_MODEL or "gemini-3.6-flash"
-        obsolete_models = [
-            "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", 
-            "gemini-2.0-flash-lite", "gemini-2.5-flash"
-        ]
-        if configured in obsolete_models:
-            return "gemini-3.6-flash"
-        return configured
+        model = os.getenv("OPENROUTER_MODEL") or settings.OPENROUTER_MODEL or os.getenv("AI_MODEL") or "openrouter/free"
+        return model.strip()
+
+    def get_base_url(self) -> str:
+        url = os.getenv("OPENROUTER_BASE_URL") or getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        return url.rstrip('/')
+
+    def classify_provider_response(self, status_code: int, response_text: str) -> Tuple[str, bool, str]:
+        """
+        Classifies OpenRouter / LLM HTTP responses.
+        Returns: (error_type, is_retryable, user_facing_message)
+        """
+        text_lower = response_text.lower() if response_text else ""
+
+        if status_code == 200:
+            return "none", False, ""
+
+        if status_code == 429:
+            quota_keywords = ["quota", "exceeded", "daily limit", "monthly limit", "credits", "free tier", "insufficient", "out of credits", "resource_exhausted"]
+            is_quota = any(kw in text_lower for kw in quota_keywords)
+            if is_quota:
+                return (
+                    "quota_exceeded",
+                    False, # NO RETRY
+                    "The AI service quota has been reached. Please try again later or check your OpenRouter API settings."
+                )
+            else:
+                return (
+                    "rate_limited",
+                    True, # Transient rate limit, retryable once
+                    "The AI service is temporarily rate limited. Please try again in a moment."
+                )
+
+        if status_code in [502, 503, 504]:
+            return (
+                "service_unavailable",
+                True, # Overloaded / transient, retryable once
+                "The AI service is temporarily unavailable (503). Please try again in a moment."
+            )
+
+        if status_code in [401, 403]:
+            return (
+                "authentication_or_permission",
+                False, # NO RETRY
+                "The OpenRouter API key is invalid or unauthorized. Please set OPENROUTER_API_KEY in backend/.env."
+            )
+
+        if status_code == 400:
+            return (
+                "invalid_request",
+                False, # NO RETRY
+                "Invalid request format sent to AI service."
+            )
+
+        return (
+            "provider_error",
+            False,
+            f"AI provider error (HTTP {status_code})."
+        )
 
     async def _post_with_retry(
         self,
-        url: str,
-        headers: dict,
-        payload: dict,
-        action_label: str = "Gemini API",
-        timeout_seconds: float = 12.0,
+        messages: List[Dict[str, str]],
+        action_label: str = "OpenRouter API",
+        temperature: float = 0.4,
+        response_format: Optional[Dict[str, str]] = None,
+        timeout_seconds: float = 15.0,
         max_retries: int = 1
-    ) -> tuple[Optional[dict], Optional[int]]:
+    ) -> Tuple[Optional[str], Optional[int], int, Optional[str], str]:
         """
-        Helper to POST to Gemini API with controlled 1-retry policy for transient errors (HTTP 503, 429, Network timeouts).
-        Backoff delay: 0.8s. Per-request HTTP timeout: 12s.
+        Helper to POST to OpenRouter Chat Completions API with controlled retry policy.
+        Retries ONLY transient errors (rate_limited, service_unavailable, timeout).
+        NEVER retries permanent errors (quota_exceeded, authentication_or_permission, invalid_request).
         """
+        key = self.api_key
+        if not key or key == "YOUR_OPENROUTER_API_KEY" or len(key) < 8:
+            print(f"[AIService] {action_label} ABORTED: OPENROUTER_API_KEY is missing or unconfigured (key len: {len(key)})")
+            self.last_error_type = "unconfigured_key"
+            self.last_status_code = None
+            self.last_provider_calls = 0
+            self.last_user_message = "The OpenRouter API key is not configured in `backend/.env`. Please set `OPENROUTER_API_KEY`."
+            return None, None, 0, "unconfigured_key", self.last_user_message
+
+        model_name = self.get_model_name()
+        base_url = self.get_base_url()
+        url = f"{base_url}/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://easylearn.app",
+            "X-Title": "EASY-LEARN"
+        }
+
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": 2048
+        }
+        if response_format:
+            payload["response_format"] = response_format
+
         backoff_delays = [0.8]
-        last_status = None
-        self.last_error_type = None
+        attempts_made = 0
+        last_status = 500
+        last_error_type = "provider_error"
+        last_user_msg = "An error occurred with the AI service."
 
         for attempt in range(max_retries + 1):
+            attempts_made += 1
             if attempt > 0:
                 delay = backoff_delays[min(attempt - 1, len(backoff_delays) - 1)]
-                print(f"[AIService] Transient failure on {action_label}. Retrying (attempt {attempt}/{max_retries}) after {delay}s backoff...")
+                print(f"[AIService] Transient failure on {action_label}. Retrying attempt {attempts_made}/{max_retries + 1} after {delay}s backoff...")
                 await asyncio.sleep(delay)
 
-            print(f"[AIService] Calling {action_label} (attempt {attempt + 1}/{max_retries + 1})...")
             try:
                 async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                     res = await client.post(url, headers=headers, json=payload)
                     last_status = res.status_code
-                    print(f"[AIService] {action_label} response status: {res.status_code}")
 
                     if res.status_code == 200:
-                        self.last_error_type = None
-                        return res.json(), 200
+                        data = res.json()
+                        choices = data.get("choices", [])
+                        if choices:
+                            text_content = choices[0].get("message", {}).get("content", "")
+                            print(f"[AI] provider=openrouter model={model_name} attempt={attempts_made} status=200")
+                            self.last_error_type = None
+                            self.last_status_code = 200
+                            self.last_provider_calls = attempts_made
+                            self.last_user_message = ""
+                            return text_content.strip(), 200, attempts_made, None, ""
+                        else:
+                            print(f"[AIService] OpenRouter returned 200 but choices array was empty: {data}")
 
-                    # Handle transient errors: 503 (High Demand/Busy) or 429 (Rate Limit)
-                    if res.status_code in [503, 429]:
-                        self.last_error_type = "AI_SERVICE_UNAVAILABLE" if res.status_code == 503 else "RATE_LIMIT"
-                        print(f"[AIService] {action_label} transient HTTP {res.status_code}: {res.text[:250]}")
-                        # Will loop to retry if attempt < max_retries
-                        continue
-                    elif res.status_code in [401, 403]:
-                        self.last_error_type = "INVALID_API_KEY"
-                        print(f"[AIService] {action_label} permanent auth error HTTP {res.status_code}: {res.text[:250]}")
-                        return None, res.status_code
-                    else:
-                        self.last_error_type = "API_ERROR"
-                        print(f"[AIService] {action_label} HTTP error ({res.status_code}): {res.text[:250]}")
-                        return None, res.status_code
+                    error_type, is_retryable, user_msg = self.classify_provider_response(res.status_code, res.text)
+                    last_error_type = error_type
+                    last_user_msg = user_msg
+
+                    print(f"[AI] provider=openrouter model={model_name} attempt={attempts_made} status={res.status_code} error_type={error_type}")
+                    print(f"[AIService] {action_label} HTTP {res.status_code} [{error_type}]: {res.text[:250]}")
+
+                    if not is_retryable:
+                        print(f"[AIService] {action_label} non-retryable error ({error_type}). Aborting retries immediately.")
+                        break
 
             except (httpx.TimeoutException, httpx.NetworkError) as net_err:
-                self.last_error_type = "NETWORK_ERROR"
-                print(f"[AIService] {action_label} network exception (attempt {attempt + 1}): {repr(net_err)}")
-                # Will loop to retry if attempt < max_retries
-                continue
+                last_status = 408
+                last_error_type = "timeout"
+                last_user_msg = "Network timeout communicating with the AI service."
+                print(f"[AI] provider=openrouter model={model_name} attempt={attempts_made} status=408 error_type=timeout")
+                print(f"[AIService] {action_label} network exception (attempt {attempts_made}): {repr(net_err)}")
             except Exception as e:
-                self.last_error_type = "UNKNOWN_ERROR"
+                last_status = 500
+                last_error_type = "provider_error"
+                last_user_msg = "Unexpected error communicating with AI service."
                 print(f"[AIService] {action_label} non-retryable exception: {repr(e)}")
-                return None, last_status
+                break
 
-        return None, last_status
+        self.last_error_type = last_error_type
+        self.last_status_code = last_status
+        self.last_provider_calls = attempts_made
+        self.last_user_message = last_user_msg
+        return None, last_status, attempts_made, last_error_type, last_user_msg
 
+    async def generate_json(
+        self,
+        prompt: str,
+        system_prompt: str = "You are EASY-LEARN, an expert AI Study Assistant."
+    ) -> Optional[Dict[str, Any]]:
+        """Call OpenRouter Chat Completions API with provided prompt for JSON response."""
+        messages = [
+            {"role": "system", "content": system_prompt + "\nRespond strictly in valid JSON format."},
+            {"role": "user", "content": prompt}
+        ]
 
-    async def generate_json(self, prompt: str, system_prompt: str = "You are EASY-LEARN, an expert AI Study Assistant.") -> Optional[Dict[str, Any]]:
-        """Call Google Gemini REST API with provided prompt for JSON response."""
-        key = self.api_key
-        if not key or key == "YOUR_GEMINI_API_KEY" or len(key) < 10:
-            print(f"[AIService] generate_json ABORTED: API Key is missing or placeholder (key len: {len(key)})")
-            self.last_error_type = "UNCONFIGURED_KEY"
-            return None
+        text_res, status, calls, err_type, err_msg = await self._post_with_retry(
+            messages=messages,
+            action_label=f"OpenRouter JSON API ({self.get_model_name()})",
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
 
-        model_name = self.get_model_name()
-        base = self.base_url.rstrip('/')
-        model_path = model_name if model_name.startswith("models/") else f"models/{model_name}"
-        url = f"{base}/v1beta/{model_path}:generateContent?key={key}"
+        if text_res:
+            clean_text = re.sub(r'^```(json)?\s*', '', text_res.strip(), flags=re.IGNORECASE)
+            clean_text = re.sub(r'\s*```$', '', clean_text).strip()
 
-        headers = {
-            "Content-Type": "application/json"
-        }
+            try:
+                return json.loads(clean_text, strict=False)
+            except Exception as p_err:
+                print(f"[AIService] Direct JSON parse failed: {p_err}. Trying regex object match...")
 
-        payload = {
-            "systemInstruction": {
-                "parts": [
-                    {"text": system_prompt + " Respond strictly in valid JSON format."}
-                ]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": prompt}
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.3
-            }
-        }
-
-        data, status = await self._post_with_retry(url, headers, payload, action_label=f"Gemini API ({model_name})")
-        if data:
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    raw_text = parts[0].get("text", "")
-                    clean_text = re.sub(r'^```(json)?\s*', '', raw_text.strip(), flags=re.IGNORECASE)
-                    clean_text = re.sub(r'\s*```$', '', clean_text).strip()
-                    
-                    try:
-                        return json.loads(clean_text, strict=False)
-                    except Exception as p_err:
-                        print(f"[AIService] JSON parse failed: {p_err}. Trying regex object match...")
-
-                    json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
-                    if json_match:
-                        try:
-                            return json.loads(json_match.group(0), strict=False)
-                        except Exception as r_err:
-                            print(f"[AIService] Regex JSON parse failed: {r_err}")
-            else:
-                print(f"[AIService] No candidates returned in Gemini JSON response: {data}")
+            json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+            if json_match:
+                try:
+                    return json.loads(json_match.group(0), strict=False)
+                except Exception as r_err:
+                    print(f"[AIService] Regex JSON parse failed: {r_err}")
 
         return None
 
-    async def generate_text(self, prompt: str, system_prompt: str = "You are EASY-LEARN, an expert AI Assistant.") -> Optional[str]:
-        """Call Google Gemini REST API to generate freeform text response."""
-        key = self.api_key
-        if not key or key == "YOUR_GEMINI_API_KEY" or len(key) < 10:
-            print(f"[AIService] generate_text ABORTED: API Key is missing or placeholder (key len: {len(key)})")
-            self.last_error_type = "UNCONFIGURED_KEY"
-            return None
+    async def generate_text(
+        self,
+        prompt: Optional[str] = None,
+        system_prompt: str = "You are EASY-LEARN, an expert AI Assistant.",
+        messages: Optional[List[Dict[str, str]]] = None
+    ) -> Optional[str]:
+        """Call OpenRouter Chat Completions API to generate freeform text response."""
+        if not messages:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt or ""}
+            ]
+        elif system_prompt and not any(m.get("role") == "system" for m in messages):
+            messages = [{"role": "system", "content": system_prompt}] + messages
 
-        model_name = self.get_model_name()
-        base = self.base_url.rstrip('/')
-        model_path = model_name if model_name.startswith("models/") else f"models/{model_name}"
-        url = f"{base}/v1beta/{model_path}:generateContent?key={key}"
-
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "systemInstruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.4
-            }
-        }
-
-        data, status = await self._post_with_retry(url, headers, payload, action_label=f"Gemini Text API ({model_name})")
-        if data:
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "").strip()
-            else:
-                print(f"[AIService] No candidates returned in Gemini text response: {data}")
-
-        return None
+        text_res, status, calls, err_type, err_msg = await self._post_with_retry(
+            messages=messages,
+            action_label=f"OpenRouter Text API ({self.get_model_name()})",
+            temperature=0.4
+        )
+        return text_res
 
     # --- Built-in Smart NLP Engine ---
     def is_substantive_sentence(self, sentence: str) -> bool:

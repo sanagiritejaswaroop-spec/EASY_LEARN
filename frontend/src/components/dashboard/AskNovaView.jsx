@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { MessageSquareText, Send, Sparkles, User, Bot } from 'lucide-react';
+import { MessageSquareText, Send, Sparkles, User, Bot, AlertTriangle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useStudy } from '../../context/StudyContext';
 import { sendChatMessage } from '../../services/api';
@@ -72,6 +72,7 @@ const renderFormattedMarkdown = (text) => {
         {lines.map((line, lIdx) => {
           const trimmed = line.trim();
           if (!trimmed) return <div key={lIdx} className="h-1" />;
+          if (trimmed.toLowerCase() === 'svg' || trimmed === '<svg>' || trimmed === '</svg>') return null;
 
           if (line.startsWith('# ')) {
             return (
@@ -140,7 +141,9 @@ export const AskNovaView = () => {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [chatError, setChatError] = useState(null);
   const messagesEndRef = useRef(null);
+  const isSendingRef = useRef(false);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -148,41 +151,47 @@ export const AskNovaView = () => {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, loading]);
+  }, [messages, loading, chatError]);
 
   const handleSend = async (textToSend) => {
-    if (loading) return;
+    if (isSendingRef.current || loading) return;
     const query = textToSend || input;
     if (!query.trim()) return;
 
+    isSendingRef.current = true;
     const userMsg = { role: 'user', content: query };
     setMessages((prev) => [...prev, userMsg]);
     if (!textToSend) setInput('');
     setLoading(true);
+    setChatError(null);
 
     try {
       const historyPayload = messages.map((m) => ({ role: m.role, content: m.content }));
       const fileId = docData?.file_id || '';
       const res = await sendChatMessage(fileId, query, historyPayload);
 
-      const botMsg = {
-        role: 'assistant',
-        content: res.reply || 'The AI service is temporarily busy. Please try again in a moment.',
-        followups: res.suggested_followups || []
-      };
-
-      setMessages((prev) => [...prev, botMsg]);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        {
+      if (res.success === false || res.error) {
+        setChatError({
+          type: res.error?.type || res.error_type || 'error',
+          message: res.error?.message || res.reply || 'AI generation is temporarily unavailable. Please try again later.'
+        });
+      } else {
+        setChatError(null);
+        const botMsg = {
           role: 'assistant',
-          content: 'The AI service is temporarily busy. Please try again in a moment.',
-          followups: []
-        }
-      ]);
+          content: res.reply || '',
+          followups: res.suggested_followups || []
+        };
+        setMessages((prev) => [...prev, botMsg]);
+      }
+    } catch (err) {
+      setChatError({
+        type: 'network_error',
+        message: 'Unable to connect to the backend server. Please verify backend service and API configuration.'
+      });
     } finally {
       setLoading(false);
+      isSendingRef.current = false;
     }
   };
 
@@ -266,6 +275,28 @@ export const AskNovaView = () => {
               <Sparkles className="w-4 h-4 text-indigo-400 animate-spin" />
             </div>
             <span className="font-mono animate-pulse">EASY-LEARN is processing your question...</span>
+          </motion.div>
+        )}
+
+        {chatError && (
+          <motion.div
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="p-4 rounded-xl bg-amber-950/40 border border-amber-800/60 text-amber-200 text-xs sm:text-sm flex items-start gap-3 shadow-lg my-2"
+          >
+            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div className="flex-1 space-y-1">
+              <div className="font-bold text-amber-300 uppercase text-[11px] tracking-wider font-['Outfit']">
+                {chatError.type === 'quota_exceeded' ? 'AI Quota Exceeded' : 'AI Service Notice'}
+              </div>
+              <p className="leading-relaxed text-slate-300">{chatError.message}</p>
+            </div>
+            <button
+              onClick={() => setChatError(null)}
+              className="text-slate-400 hover:text-slate-200 text-xs px-1.5 py-0.5"
+            >
+              ✕
+            </button>
           </motion.div>
         )}
 

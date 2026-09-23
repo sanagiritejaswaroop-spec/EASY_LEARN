@@ -182,9 +182,9 @@ Return JSON:
                 "suggested_followups": []
             }
 
-        # 6. System Instruction for Gemini (General-Purpose AI Assistant like ChatGPT)
-        key_present = bool(ai_service.get_api_key() and ai_service.get_api_key() != 'YOUR_GEMINI_API_KEY')
-        print(f"[CHAT TRACE] Intent: {intent} | File ID: {file_id or 'None'} | PDF Retrieval Attempted: {bool(relevant_chunks)} | API Key Loaded: {'YES' if key_present else 'NO'}")
+        # 6. System Instruction for OpenRouter AI Assistant
+        key_present = bool(ai_service.get_api_key() and ai_service.get_api_key() != 'YOUR_OPENROUTER_API_KEY')
+        print(f"[CHAT TRACE] intent={intent} pdf_retrieval={str(bool(relevant_chunks)).lower()}")
 
         system_instruction = (
             "You are EASY-LEARN, a general-purpose AI assistant with optional access to uploaded study material.\n\n"
@@ -203,33 +203,22 @@ Return JSON:
             "For conversational questions, respond naturally."
         )
 
-        if formatted_context:
-            prompt = f"""
-DOCUMENT CONTEXT (from uploaded file '{doc["filename"] if doc else "Document"}'):
-{formatted_context}
+        messages_payload = prepare_chat_messages(
+            message=original_message,
+            history=history or [],
+            system_instruction=system_instruction,
+            formatted_context=formatted_context
+        )
 
-USER QUESTION:
-"{original_message}"
-
-Answer the user's question using clean Markdown formatting.
-"""
-        else:
-            prompt = f"""
-USER QUESTION:
-"{original_message}"
-
-Answer the user's question directly using clean Markdown formatting.
-"""
-
-        # Generate single fast response directly using Gemini
-        t_gem_start = time.perf_counter()
-        text_res = await ai_service.generate_text(prompt, system_prompt=system_instruction)
-        t_gemini = (time.perf_counter() - t_gem_start) * 1000
+        # Generate single fast response directly using OpenRouter
+        t_prov_start = time.perf_counter()
+        text_res = await ai_service.generate_text(system_prompt=system_instruction, messages=messages_payload)
+        t_provider = (time.perf_counter() - t_prov_start) * 1000
         t_total = (time.perf_counter() - t_start) * 1000
-
-        print(f"[PERF] feature=chat intent={intent} pdf_cache={'hit' if doc else 'miss'} retrieval={t_retrieval:.1f}ms gemini={t_gemini:.1f}ms total={t_total:.1f}ms gemini_calls=1")
+        provider_calls = ai_service.last_provider_calls or (1 if text_res else 0)
 
         if text_res:
+            print(f"[PERF] feature=chat intent={intent} pdf_cache={'hit' if doc else 'miss'} retrieval={t_retrieval:.1f}ms provider={t_provider:.1f}ms total={t_total:.1f}ms provider_calls={provider_calls}")
             clean_reply = sanitize_text(text_res)
             uses_pdf = intent in ["PDF_SPECIFIC", "MIXED"] and len(relevant_chunks) > 0
             if uses_pdf and unique_sources and "Sources:" not in clean_reply:
@@ -241,28 +230,16 @@ Answer the user's question directly using clean Markdown formatting.
             return {
                 "reply": clean_reply,
                 "sources": final_sources,
-                "suggested_followups": []
+                "suggested_followups": [],
+                "success": True,
+                "error_type": None,
+                "error": None
             }
 
-        # Check specific AI service error status
-        err_type = ai_service.last_error_type
-        if err_type in ["AI_SERVICE_UNAVAILABLE", "RATE_LIMIT"]:
-            return {
-                "reply": "The AI service is temporarily busy. Please try again in a moment.",
-                "sources": [],
-                "suggested_followups": [],
-                "success": False,
-                "error_type": "AI_SERVICE_UNAVAILABLE"
-            }
-
-        if err_type in ["INVALID_API_KEY", "UNCONFIGURED_KEY"] or not key_present:
-            return {
-                "reply": "The Gemini API key is not configured in `backend/.env`. Please set `AI_API_KEY` in your `.env` file.",
-                "sources": [],
-                "suggested_followups": [],
-                "success": False,
-                "error_type": "INVALID_API_KEY"
-            }
+        # Handle failure cases
+        err_type = ai_service.last_error_type or "provider_error"
+        user_msg = ai_service.last_user_message or "Sorry, I couldn't generate a response right now. Please try again later."
+        print(f"[PERF] feature=chat intent={intent} provider_calls={provider_calls} error_type={err_type}")
 
         # If PDF was requested and chunks exist, provide PDF excerpt as backup
         if intent in ["PDF_SPECIFIC", "MIXED"] and relevant_chunks:
@@ -275,16 +252,48 @@ Answer the user's question directly using clean Markdown formatting.
                 "sources": unique_sources,
                 "suggested_followups": [],
                 "success": True,
-                "error_type": None
+                "error_type": None,
+                "error": None
             }
 
         return {
-            "reply": "Sorry, I couldn't generate a response right now. Please try again in a moment.",
+            "reply": user_msg,
             "sources": [],
             "suggested_followups": [],
             "success": False,
-            "error_type": "GENERAL_ERROR"
+            "error_type": err_type,
+            "error": {
+                "type": err_type,
+                "message": user_msg
+            }
         }
+
+def prepare_chat_messages(message: str, history: List[Dict[str, str]], system_instruction: str, formatted_context: str = "") -> List[Dict[str, str]]:
+    messages = [{"role": "system", "content": system_instruction}]
+
+    bounded_history = []
+    if history:
+        clean_history = [
+            h for h in history
+            if h.get("content") and not h.get("content", "").startswith("AI generation is temporarily unavailable")
+               and not h.get("content", "").startswith("The AI service")
+               and not h.get("content", "").startswith("The OpenRouter API key")
+        ]
+        bounded_history = clean_history[-6:]
+
+    for h in bounded_history:
+        role = "assistant" if h.get("role") in ["assistant", "model"] else "user"
+        content = h.get("content", "").strip()
+        if content:
+            messages.append({"role": role, "content": content})
+
+    if formatted_context:
+        user_content = f"DOCUMENT CONTEXT:\n{formatted_context}\n\nUSER QUESTION:\n{message}"
+    else:
+        user_content = message
+
+    messages.append({"role": "user", "content": user_content})
+    return messages
 
 chat_service = ChatService()
 

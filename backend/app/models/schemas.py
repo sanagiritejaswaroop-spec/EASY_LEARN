@@ -125,12 +125,17 @@ class ChatRequest(BaseModel):
     message: str
     history: Optional[List[Dict[str, str]]] = []
 
+class ChatErrorDetails(BaseModel):
+    type: str
+    message: str
+
 class ChatResponse(BaseModel):
     reply: str
     sources: Optional[List[str]] = []
     suggested_followups: List[str] = []
     success: Optional[bool] = True
     error_type: Optional[str] = None
+    error: Optional[ChatErrorDetails] = None
 
 class CheckpointQuestion(BaseModel):
     id: str
